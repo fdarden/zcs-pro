@@ -1,0 +1,23 @@
+# ESP32-C3 Super Mini ZCS variant. The selected pins avoid the C3 strapping
+# pins (GPIO2/8/9), native USB pins (GPIO18/19), and embedded-flash pins.
+substitutions:
+  device_name: supermini-zcs
+  friendly_name: "Super Mini ZCS"
+  pump_gpio: GPIO4
+  pump_gpio_idf: GPIO_NUM_4
+  prime_button_gpio: GPIO3
+  status_led_gpio: GPIO10
+  status_led_gpio_idf: GPIO_NUM_10
+  i2c_sda_gpio: GPIO6
+  i2c_scl_gpio: GPIO7
+
+packages:
+  zcs_pro: !include zcs-pro.yaml
+
+esp32:
+  board: esp32-c3-devkitm-1
+  framework:
+    type: esp-idf
+
+logger:
+  hardware_uart: USB_SERIAL_JTAG
