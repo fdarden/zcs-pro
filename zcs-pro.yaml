@@ -1,0 +1,1861 @@
+substitutions:
+  device_name: zcs-pro
+  friendly_name: "ZCS PRO"
+  firmware_version: "1.2.2"
+  api_encryption_key: !secret api_encryption_key
+  timezone_default: "America/New_York"
+  pump_gpio: GPIO23
+  pump_gpio_idf: GPIO_NUM_23
+  pump_inverted: "false"       # Change to "true" only if bench testing proves active LOW.
+  prime_button_gpio: GPIO32    # Safe general-purpose pin; not an ESP32 strapping pin.
+  prime_button_hold: 3s
+  status_led_gpio: GPIO25
+  status_led_gpio_idf: GPIO_NUM_25
+  i2c_sda_gpio: GPIO21
+  i2c_scl_gpio: GPIO22
+  manual_awake_ms: '300000U'   # Five-minute management window after a button/cold wake.
+  timer_awake_ms: '120000U'    # Two-minute management window after a timer wake.
+  test_sleep_duration: 5min    # Recoverable commissioning cycle until the wake button is fitted.
+
+esphome:
+  name: ${device_name}
+  friendly_name: ${friendly_name}
+  min_version: 2025.5.0
+  includes:
+    - includes/zcs_pro.h
+  project:
+    name: "zoogloea-control-system.zcs-pro"
+    version: ${firmware_version}
+  on_boot:
+    # Preload the physical inactive level before making the pump pin an output. This
+    # runs ahead of ordinary hardware-component setup under ESP-IDF.
+    - priority: 1000
+      then:
+        - lambda: |-
+            const int inactive_level = ${pump_inverted} ? 1 : 0;
+            gpio_set_level(${pump_gpio_idf}, inactive_level);
+            gpio_set_direction(${pump_gpio_idf}, GPIO_MODE_OUTPUT);
+            gpio_set_level(${status_led_gpio_idf}, 1);
+            gpio_set_direction(${status_led_gpio_idf}, GPIO_MODE_OUTPUT);
+    # The GPIO output component is initialized at the hardware priority. This
+    # explicit OFF command runs immediately afterward, before networking/API.
+    - priority: 800
+      then:
+        - output.turn_off: pump_output
+        - output.turn_on: status_led_output
+        - script.stop: pump_request
+        - lambda: |-
+            id(pump_active) = false;
+            id(active_source) = VB_FAULT;
+            id(active_requested_ml) = 0.0f;
+            id(active_expected_ml) = 0.0f;
+            const auto cause = esp_sleep_get_wakeup_cause();
+            if (cause == ESP_SLEEP_WAKEUP_EXT0 || cause == ESP_SLEEP_WAKEUP_EXT1) {
+              id(wake_reason) = "Physical button";
+              id(awake_until_ms) = millis() + ${manual_awake_ms};
+            } else if (cause == ESP_SLEEP_WAKEUP_TIMER) {
+              id(wake_reason) = "Test-cycle timer";
+              id(awake_until_ms) = millis() + ${timer_awake_ms};
+            } else {
+              id(wake_reason) = "Power-on or reset";
+              id(awake_until_ms) = millis() + ${manual_awake_ms};
+            }
+    # Read the optional RTC once. A missing device is a non-fatal condition.
+    - priority: 600
+      then:
+        - delay: 300ms
+        - ds1307.read_time:
+            id: rtc_time
+        - delay: 300ms
+        - lambda: |-
+            id(rtc_present) = !id(rtc_time).is_failed();
+            const auto now = id(rtc_time).now();
+            id(rtc_time_valid) = id(rtc_present) && vb_sane_time(now);
+            if (id(rtc_time_valid)) id(time_source) = 1;
+    # Register an authenticated, no-store endpoint used only when the local
+    # Settings page explicitly asks to reveal the Home Assistant API key.
+    - priority: -100
+      then:
+        - lambda: |-
+            vb_register_api_key_handler("${api_encryption_key}");
+  on_shutdown:
+    priority: 800
+    then:
+      - output.turn_off: pump_output
+      - output.turn_off: status_led_output
+      - script.stop: pump_request
+      - lambda: |-
+          id(pump_active) = false;
+          const auto now = id(sntp_time).now();
+          if (vb_sane_time(now)) id(last_clock_epoch) = now.timestamp;
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+
+preferences:
+  flash_write_interval: 5min
+
+logger:
+  level: INFO
+
+api:
+  id: api_server
+  reboot_timeout: 0s
+  encryption:
+    key: ${api_encryption_key}
+  actions:
+    - action: run_timed
+      variables:
+        seconds: int
+      then:
+        - script.execute:
+            id: pump_request
+            runtime_ms: !lambda 'return seconds * 1000;'
+            source: !lambda 'return static_cast<int>(VB_HOME_ASSISTANT);'
+            requested_ml: 0.0
+            expected_ml: !lambda |-
+              return id(flow_ml_per_sec) > 0.0f
+                         ? seconds * id(flow_ml_per_sec)
+                         : 0.0f;
+    - action: dose_volume
+      variables:
+        milliliters: float
+      then:
+        - script.execute:
+            id: volume_request
+            milliliters: !lambda 'return milliliters;'
+            source: !lambda 'return static_cast<int>(VB_HOME_ASSISTANT);'
+    - action: prime
+      then:
+        - script.execute:
+            id: pump_request
+            runtime_ms: !lambda 'return static_cast<int>(id(prime_duration).state * 1000.0f);'
+            source: !lambda 'return static_cast<int>(VB_HOME_ASSISTANT);'
+            requested_ml: 0.0
+            expected_ml: !lambda |-
+              return id(flow_ml_per_sec) > 0.0f
+                         ? id(prime_duration).state * id(flow_ml_per_sec)
+                         : 0.0f;
+    - action: stop
+      then:
+        - script.execute: pump_stop
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+    on_begin:
+      then:
+        - lambda: 'id(ota_active) = true;'
+        - deep_sleep.prevent: power_save_sleep
+        - output.turn_off: pump_output
+        - script.stop: pump_request
+        - lambda: 'id(pump_active) = false;'
+  - platform: web_server
+    on_begin:
+      then:
+        - lambda: 'id(ota_active) = true;'
+        - deep_sleep.prevent: power_save_sleep
+        - output.turn_off: pump_output
+        - script.stop: pump_request
+        - lambda: 'id(pump_active) = false;'
+
+safe_mode:
+  boot_is_good_after: 60s
+  num_attempts: 5
+  reboot_timeout: 10min
+  on_safe_mode:
+    then:
+      - lambda: |-
+          const int inactive_level = ${pump_inverted} ? 1 : 0;
+          gpio_set_level(${pump_gpio_idf}, inactive_level);
+          gpio_set_direction(${pump_gpio_idf}, GPIO_MODE_OUTPUT);
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  reboot_timeout: 0s
+  power_save_mode: none
+  ap:
+    ssid: "ZCS PRO Setup"
+    password: !secret fallback_ap_password
+    ap_timeout: 90s
+
+captive_portal:
+
+mdns:
+
+web_server:
+  id: local_web
+  port: 80
+  version: 2
+  css_url: ""
+  js_url: ""
+  css_include: web/zcs-pro.css
+  js_include: web/zcs-pro.js
+  log: false
+  auth:
+    type: digest
+    username: !secret web_admin_username
+    password: !secret web_admin_password
+
+i2c:
+  id: i2c_bus
+  sda: ${i2c_sda_gpio}
+  scl: ${i2c_scl_gpio}
+  scan: true
+  frequency: 100kHz
+
+time:
+  # DS3231 uses the DS1307-compatible register interface at address 0x68.
+  # update_interval is disabled so an absent RTC cannot repeatedly interfere.
+  - platform: ds1307
+    id: rtc_time
+    address: 0x68
+    timezone: ${timezone_default}
+    update_interval: never
+  - platform: sntp
+    id: sntp_time
+    timezone: ${timezone_default}
+    servers:
+      - 0.pool.ntp.org
+      - 1.pool.ntp.org
+      - 2.pool.ntp.org
+    on_time_sync:
+      then:
+        - lambda: |-
+            const auto now = id(sntp_time).now();
+            if (vb_sane_time(now)) {
+              id(network_time_synced) = true;
+              id(time_source) = 2;
+            }
+        - if:
+            condition:
+              lambda: 'return id(rtc_present) && id(network_time_synced);'
+            then:
+              - ds1307.write_time:
+                  id: rtc_time
+              - lambda: 'id(rtc_time_valid) = true;'
+
+output:
+  - platform: gpio
+    id: pump_output
+    pin:
+      number: ${pump_gpio}
+      inverted: ${pump_inverted}
+
+  - platform: gpio
+    id: status_led_output
+    pin:
+      number: ${status_led_gpio}
+      inverted: false
+
+deep_sleep:
+  id: power_save_sleep
+  wakeup_pin:
+    number: ${prime_button_gpio}
+    inverted: true
+    allow_other_uses: true
+    mode:
+      input: true
+      pullup: true
+  wakeup_pin_mode: KEEP_AWAKE
+
+# GPIO25 is the awake/dose status LED. GPIO33 is a suggested reservoir input
+# and GPIO27 a suggested flow input; neither input is driven/read in v1.2.
+
+globals:
+  - id: pump_active
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  - id: pump_started_ms
+    type: uint32_t
+    restore_value: false
+    initial_value: '0'
+  - id: active_source
+    type: int
+    restore_value: false
+    initial_value: '6'
+  - id: active_requested_ml
+    type: float
+    restore_value: false
+    initial_value: '0.0'
+  - id: active_expected_ml
+    type: float
+    restore_value: false
+    initial_value: '0.0'
+  - id: request_approved
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  - id: ota_active
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  - id: awake_until_ms
+    type: uint32_t
+    restore_value: false
+    initial_value: '0'
+  - id: sleep_entry_allowed
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  - id: physical_long_armed
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  - id: led_pattern_active
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  - id: led_blink_phase
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  - id: wake_reason
+    type: std::string
+    restore_value: false
+    initial_value: '"Power-on or reset"'
+  - id: power_action_result
+    type: std::string
+    restore_value: false
+    initial_value: '"Power saving disabled — device remains awake"'
+  - id: flow_ml_per_sec
+    type: float
+    restore_value: true
+    update_interval: 5min
+    initial_value: '0.0'
+  - id: calibration_date
+    type: std::string
+    restore_value: true
+    update_interval: 5min
+    max_restore_data_length: 40
+    initial_value: '"Never"'
+  - id: calibration_run_complete
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  - id: last_calibration_runtime_seconds
+    type: float
+    restore_value: false
+    initial_value: '0.0'
+  - id: lifetime_runtime_seconds
+    type: double
+    restore_value: true
+    update_interval: 5min
+    initial_value: '0.0'
+  - id: lifetime_volume_ml
+    type: double
+    restore_value: true
+    update_interval: 5min
+    initial_value: '0.0'
+  - id: today_volume_ml
+    type: float
+    restore_value: true
+    update_interval: 5min
+    initial_value: '0.0'
+  - id: daily_day_key
+    type: uint32_t
+    restore_value: true
+    update_interval: 5min
+    initial_value: '0'
+  - id: dose_count
+    type: uint32_t
+    restore_value: true
+    update_interval: 5min
+    initial_value: '0'
+  - id: last_successful_dose
+    type: std::string
+    restore_value: true
+    update_interval: 5min
+    max_restore_data_length: 100
+    initial_value: '"None"'
+  - id: last_attempted_dose
+    type: std::string
+    restore_value: true
+    update_interval: 5min
+    max_restore_data_length: 100
+    initial_value: '"None"'
+  - id: last_automatic_epoch
+    type: uint32_t
+    restore_value: true
+    update_interval: 5min
+    initial_value: '0'
+  - id: last_schedule_slot_epoch
+    type: uint32_t
+    restore_value: true
+    update_interval: 5min
+    initial_value: '0'
+  - id: last_clock_epoch
+    type: uint32_t
+    restore_value: true
+    update_interval: 5min
+    initial_value: '0'
+  - id: last_clock_checkpoint_ms
+    type: uint32_t
+    restore_value: false
+    initial_value: '0'
+  - id: boot_missed_check_done
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  - id: schedule_due
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  - id: schedule_due_ml
+    type: float
+    restore_value: false
+    initial_value: '0.0'
+  - id: rtc_present
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  - id: rtc_time_valid
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  - id: rtc_sync_allowed
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  - id: rtc_sync_result
+    type: std::string
+    restore_value: false
+    initial_value: '"Automatic network sync active"'
+  - id: network_time_synced
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  - id: time_source
+    type: int
+    restore_value: false
+    initial_value: '0'  # 0 invalid, 1 RTC, 2 network-corrected
+  - id: fault_text
+    type: std::string
+    restore_value: false
+    initial_value: '"None"'
+  - id: factory_reset_armed_until
+    type: uint32_t
+    restore_value: false
+    initial_value: '0'
+  - id: dose_history_store
+    # A 4-byte-aligned raw blob avoids relying on custom type declarations in
+    # ESPHome's generated-global preamble. vb_history() provides the safe view.
+    type: uint32_t[502]
+    restore_value: true
+    update_interval: 5min
+    initial_value: 'std::array<uint32_t, 502>{}'
+
+script:
+  # This is the only script allowed to energize pump_output. Every automatic,
+  # web, button and API run request is routed here.
+  - id: pump_request
+    mode: single
+    parameters:
+      runtime_ms: int
+      source: int
+      requested_ml: float
+      expected_ml: float
+    then:
+      - lambda: |-
+          id(request_approved) = false;
+          const auto now = id(sntp_time).now();
+          const uint32_t epoch = vb_sane_time(now) ? now.timestamp : 0;
+          uint8_t rejection = VB_SUCCESS;
+
+          if (vb_sane_time(now)) {
+            const uint32_t day_key = vb_local_day_key(now);
+            if (day_key != id(daily_day_key)) {
+              id(daily_day_key) = day_key;
+              id(today_volume_ml) = 0.0f;
+            }
+          }
+
+          if (id(pump_active)) {
+            rejection = VB_REJECTED_BUSY;
+          } else if (runtime_ms <= 0 || runtime_ms > 120000 ||
+                     runtime_ms > static_cast<int>(id(max_continuous_runtime).state * 1000.0f)) {
+            rejection = VB_REJECTED_RUNTIME;
+          } else if (requested_ml > 0.0f && id(flow_ml_per_sec) <= 0.0f) {
+            rejection = VB_REJECTED_UNCALIBRATED;
+          } else if (source == VB_SCHEDULE &&
+                     (!vb_sane_time(now) || id(time_source) == 0)) {
+            rejection = VB_TIME_INVALID;
+          } else if (source == VB_SCHEDULE && id(last_automatic_epoch) > 0 &&
+                     epoch > id(last_automatic_epoch) &&
+                     epoch - id(last_automatic_epoch) <
+                       static_cast<uint32_t>(id(auto_min_interval).state * 60.0f)) {
+            rejection = VB_REJECTED_LOCKOUT;
+          } else if (source != VB_CALIBRATION && id(flow_ml_per_sec) > 0.0f &&
+                     id(max_daily_dose).state > 0.0f &&
+                     id(today_volume_ml) +
+                       runtime_ms / 1000.0f * id(flow_ml_per_sec) >
+                         id(max_daily_dose).state + 0.001f) {
+            rejection = VB_REJECTED_DAILY_LIMIT;
+          }
+
+          if (rejection != VB_SUCCESS) {
+            id(fault_text) = VBHistory::result_name(rejection);
+            id(last_attempted_dose) = vb_format_epoch(epoch) + " — " +
+                                      VBHistory::result_name(rejection);
+            vb_history(id(dose_history_store)).add(
+                epoch, requested_ml, expected_ml, 0,
+                static_cast<uint8_t>(source), rejection);
+            id(dose_history).publish_state(vb_history(id(dose_history_store)).to_json());
+            ESP_LOGW("zcs_pro", "Pump request rejected: %s",
+                     VBHistory::result_name(rejection));
+            return;
+          }
+
+          id(request_approved) = true;
+          id(pump_active) = true;
+          id(pump_started_ms) = millis();
+          id(active_source) = source;
+          id(active_requested_ml) = requested_ml;
+          id(active_expected_ml) = expected_ml;
+          const uint32_t dose_awake_until =
+              millis() + static_cast<uint32_t>(runtime_ms) + 120000U;
+          if (static_cast<int32_t>(dose_awake_until - id(awake_until_ms)) > 0)
+            id(awake_until_ms) = dose_awake_until;
+          id(fault_text) = "None";
+          id(last_attempted_dose) = vb_format_epoch(epoch) + " — " +
+                                    VBHistory::source_name(source);
+          if (source == VB_CALIBRATION) id(calibration_run_complete) = false;
+      - if:
+          condition:
+            lambda: 'return id(request_approved);'
+          then:
+            - output.turn_on: pump_output
+            - delay: !lambda 'return static_cast<uint32_t>(runtime_ms);'
+            - output.turn_off: pump_output
+            - lambda: |-
+                if (!id(pump_active)) return;
+                const uint32_t elapsed = millis() - id(pump_started_ms);
+                const auto now = id(sntp_time).now();
+                const uint32_t epoch = vb_sane_time(now) ? now.timestamp : 0;
+                float calculated_ml = 0.0f;
+                id(lifetime_runtime_seconds) += elapsed / 1000.0;
+                if (id(active_source) != VB_CALIBRATION && id(flow_ml_per_sec) > 0.0f) {
+                  calculated_ml = elapsed / 1000.0f * id(flow_ml_per_sec);
+                  id(lifetime_volume_ml) += calculated_ml;
+                  id(today_volume_ml) += calculated_ml;
+                }
+                id(dose_count)++;
+                if (id(active_source) == VB_SCHEDULE) id(last_automatic_epoch) = epoch;
+                if (id(active_source) == VB_CALIBRATION) {
+                  id(calibration_run_complete) = true;
+                  id(last_calibration_runtime_seconds) = elapsed / 1000.0f;
+                }
+                char detail[128];
+                std::snprintf(detail, sizeof(detail), "%s — %s, %.2f mL, %.1f s",
+                              vb_format_epoch(epoch).c_str(),
+                              VBHistory::source_name(id(active_source)), calculated_ml,
+                              elapsed / 1000.0f);
+                id(last_successful_dose) = detail;
+                vb_history(id(dose_history_store)).add(
+                    epoch, id(active_requested_ml), calculated_ml, elapsed,
+                    static_cast<uint8_t>(id(active_source)), VB_SUCCESS);
+                id(dose_history).publish_state(vb_history(id(dose_history_store)).to_json());
+                id(pump_active) = false;
+                id(active_requested_ml) = 0.0f;
+                id(active_expected_ml) = 0.0f;
+                id(active_source) = VB_FAULT;
+                const uint32_t post_dose_awake = millis() + 120000U;
+                if (static_cast<int32_t>(post_dose_awake - id(awake_until_ms)) > 0)
+                  id(awake_until_ms) = post_dose_awake;
+
+  - id: pump_stop
+    mode: restart
+    then:
+      # OFF is issued before cancellation/cleanup so STOP has priority.
+      - output.turn_off: pump_output
+      - script.stop: pump_request
+      - lambda: |-
+          if (!id(pump_active)) {
+            id(active_requested_ml) = 0.0f;
+            id(active_expected_ml) = 0.0f;
+            id(active_source) = VB_FAULT;
+            return;
+          }
+          const uint32_t elapsed = millis() - id(pump_started_ms);
+          const auto now = id(sntp_time).now();
+          const uint32_t epoch = vb_sane_time(now) ? now.timestamp : 0;
+          float calculated_ml = 0.0f;
+          id(lifetime_runtime_seconds) += elapsed / 1000.0;
+          if (id(active_source) != VB_CALIBRATION && id(flow_ml_per_sec) > 0.0f) {
+            calculated_ml = elapsed / 1000.0f * id(flow_ml_per_sec);
+            id(lifetime_volume_ml) += calculated_ml;
+            id(today_volume_ml) += calculated_ml;
+          }
+          vb_history(id(dose_history_store)).add(
+              epoch, id(active_requested_ml), calculated_ml, elapsed,
+              static_cast<uint8_t>(id(active_source)), VB_STOPPED);
+          id(dose_history).publish_state(vb_history(id(dose_history_store)).to_json());
+          id(last_attempted_dose) = vb_format_epoch(epoch) + " — Stopped";
+          id(pump_active) = false;
+          id(active_requested_ml) = 0.0f;
+          id(active_expected_ml) = 0.0f;
+          id(active_source) = VB_FAULT;
+          id(fault_text) = "None";
+
+  - id: volume_request
+    mode: single
+    parameters:
+      milliliters: float
+      source: int
+    then:
+      - if:
+          condition:
+            lambda: 'return id(flow_ml_per_sec) > 0.0f && milliliters > 0.0f;'
+          then:
+            - script.execute:
+                id: pump_request
+                runtime_ms: !lambda |-
+                  return static_cast<int>(std::ceil(
+                      milliliters / id(flow_ml_per_sec) * 1000.0f));
+                source: !lambda 'return source;'
+                requested_ml: !lambda 'return milliliters;'
+                expected_ml: !lambda 'return milliliters;'
+          else:
+            - lambda: |-
+                const auto now = id(sntp_time).now();
+                const uint32_t epoch = vb_sane_time(now) ? now.timestamp : 0;
+                id(fault_text) = "Volume dosing unavailable: calibration required";
+                id(last_attempted_dose) = vb_format_epoch(epoch) +
+                                          " — Rejected: uncalibrated";
+                vb_history(id(dose_history_store)).add(
+                    epoch, milliliters, 0.0f, 0, static_cast<uint8_t>(source),
+                    VB_REJECTED_UNCALIBRATED);
+                id(dose_history).publish_state(vb_history(id(dose_history_store)).to_json());
+
+  - id: physical_button_hold
+    mode: restart
+    then:
+      - delay: ${prime_button_hold}
+      - if:
+          condition:
+            lambda: 'return id(prime_button).state && !id(pump_active);'
+          then:
+            - lambda: |-
+                id(physical_long_armed) = true;
+                id(led_pattern_active) = true;
+            - repeat:
+                count: 3
+                then:
+                  - output.turn_off: status_led_output
+                  - delay: 150ms
+                  - output.turn_on: status_led_output
+                  - delay: 150ms
+            - lambda: 'id(led_pattern_active) = false;'
+
+  - id: controlled_power_sleep
+    mode: single
+    then:
+      - lambda: |-
+          id(sleep_entry_allowed) =
+              id(power_saving_enabled).state && !id(pump_active) &&
+              !id(ota_active) && !id(prime_button).state &&
+              !id(led_pattern_active);
+      - if:
+          condition:
+            lambda: 'return id(sleep_entry_allowed);'
+          then:
+            - output.turn_off: pump_output
+            - output.turn_off: status_led_output
+            - lambda: |-
+                id(pump_active) = false;
+                id(last_clock_epoch) = vb_sane_time(id(sntp_time).now())
+                                           ? id(sntp_time).now().timestamp
+                                           : id(last_clock_epoch);
+                esphome::global_preferences->sync();
+            - delay: 100ms
+            - deep_sleep.enter:
+                id: power_save_sleep
+                sleep_duration: ${test_sleep_duration}
+          else:
+            - output.turn_on: status_led_output
+
+  - id: schedule_tick
+    mode: single
+    then:
+      - lambda: |-
+          id(schedule_due) = false;
+          const auto now = id(sntp_time).now();
+          if (!vb_sane_time(now) || id(time_source) == 0) return;
+
+          const uint32_t day_key = vb_local_day_key(now);
+          if (day_key != id(daily_day_key)) {
+            id(daily_day_key) = day_key;
+            id(today_volume_ml) = 0.0f;
+          }
+
+          uint8_t mask = 0;
+          if (id(day_sunday).state) mask |= 1U << 0;
+          if (id(day_monday).state) mask |= 1U << 1;
+          if (id(day_tuesday).state) mask |= 1U << 2;
+          if (id(day_wednesday).state) mask |= 1U << 3;
+          if (id(day_thursday).state) mask |= 1U << 4;
+          if (id(day_friday).state) mask |= 1U << 5;
+          if (id(day_saturday).state) mask |= 1U << 6;
+
+          if (!id(boot_missed_check_done)) {
+            const uint32_t missed = vb_missed_schedule_epoch(
+                id(last_clock_epoch), now.timestamp, mask,
+                static_cast<int>(id(schedule_hour).state),
+                static_cast<int>(id(schedule_minute).state));
+            if (id(schedule_enabled).state && missed > 0 &&
+                missed != id(last_schedule_slot_epoch)) {
+              vb_history(id(dose_history_store)).add(
+                  missed, id(schedule_dose_ml).state, 0.0f, 0,
+                  VB_MISSED_SCHEDULE, VB_MISSED);
+              id(last_attempted_dose) = vb_format_epoch(missed) +
+                                        " — Missed schedule (skipped)";
+              id(last_schedule_slot_epoch) = missed;
+              id(dose_history).publish_state(vb_history(id(dose_history_store)).to_json());
+            }
+            id(boot_missed_check_done) = true;
+          }
+
+          if (millis() - id(last_clock_checkpoint_ms) >= 300000U) {
+            id(last_clock_checkpoint_ms) = millis();
+            id(last_clock_epoch) = now.timestamp;
+          }
+
+          const uint8_t today_bit = static_cast<uint8_t>(1U << (now.day_of_week - 1));
+          if (!id(schedule_enabled).state || (mask & today_bit) == 0 ||
+              now.hour != static_cast<int>(id(schedule_hour).state) ||
+              now.minute != static_cast<int>(id(schedule_minute).state) ||
+              now.second > 2 || id(schedule_dose_ml).state <= 0.0f)
+            return;
+
+          const uint32_t slot_epoch =
+              vb_schedule_epoch(now, now.hour, now.minute);
+          if (slot_epoch == id(last_schedule_slot_epoch)) return;
+
+          // Mark the slot consumed before requesting a run. A rejection is
+          // never silently retried during the same scheduled minute.
+          id(last_schedule_slot_epoch) = slot_epoch;
+          id(schedule_due_ml) = id(schedule_dose_ml).state;
+          id(schedule_due) = true;
+      - if:
+          condition:
+            lambda: 'return id(schedule_due);'
+          then:
+            - script.execute:
+                id: volume_request
+                milliliters: !lambda 'return id(schedule_due_ml);'
+                source: !lambda 'return static_cast<int>(VB_SCHEDULE);'
+
+interval:
+  # Independent runtime watchdog. This is deliberately separate from the
+  # normal delay so the configured and absolute 120-second limits always win.
+  - interval: 250ms
+    then:
+      - if:
+          condition:
+            lambda: |-
+              if (!id(pump_active)) return false;
+              const uint32_t configured = static_cast<uint32_t>(
+                  id(max_continuous_runtime).state * 1000.0f);
+              const uint32_t limit = std::min<uint32_t>(120000U, configured);
+              return millis() - id(pump_started_ms) > limit;
+          then:
+            - output.turn_off: pump_output
+            - script.stop: pump_request
+            - lambda: |-
+                if (!id(pump_active)) return;
+                const uint32_t elapsed = millis() - id(pump_started_ms);
+                const auto now = id(sntp_time).now();
+                const uint32_t epoch = vb_sane_time(now) ? now.timestamp : 0;
+                float calculated_ml = 0.0f;
+                id(lifetime_runtime_seconds) += elapsed / 1000.0;
+                if (id(active_source) != VB_CALIBRATION && id(flow_ml_per_sec) > 0.0f) {
+                  calculated_ml = elapsed / 1000.0f * id(flow_ml_per_sec);
+                  id(lifetime_volume_ml) += calculated_ml;
+                  id(today_volume_ml) += calculated_ml;
+                }
+                vb_history(id(dose_history_store)).add(
+                    epoch, id(active_requested_ml), calculated_ml, elapsed,
+                    VB_FAULT, VB_ABORTED_WATCHDOG);
+                id(dose_history).publish_state(vb_history(id(dose_history_store)).to_json());
+                id(last_attempted_dose) = vb_format_epoch(epoch) +
+                                          " — Runtime watchdog abort";
+                id(fault_text) = "Maximum continuous runtime watchdog tripped";
+                id(pump_active) = false;
+                id(active_source) = VB_FAULT;
+                id(active_requested_ml) = 0.0f;
+                id(active_expected_ml) = 0.0f;
+  - interval: 1s
+    then:
+      - script.execute: schedule_tick
+      - if:
+          condition:
+            lambda: |-
+              return id(power_saving_enabled).state && !id(pump_active) &&
+                     static_cast<int32_t>(id(awake_until_ms) - millis()) <= 0;
+          then:
+            - script.execute: controlled_power_sleep
+  - interval: 500ms
+    then:
+      - lambda: |-
+          if (id(led_pattern_active)) return;
+          if (id(pump_active)) {
+            id(led_blink_phase) = !id(led_blink_phase);
+            if (id(led_blink_phase))
+              id(status_led_output).turn_on();
+            else
+              id(status_led_output).turn_off();
+          } else {
+            id(led_blink_phase) = false;
+            id(status_led_output).turn_on();
+          }
+
+binary_sensor:
+  - platform: gpio
+    id: prime_button
+    name: "Physical Prime Button"
+    entity_category: diagnostic
+    pin:
+      number: ${prime_button_gpio}
+      allow_other_uses: true
+      mode:
+        input: true
+        pullup: true
+      inverted: true
+    filters:
+      - delayed_on: 25ms
+      - delayed_off: 25ms
+    on_press:
+      then:
+        - lambda: |-
+            const uint32_t manual_deadline = millis() + ${manual_awake_ms};
+            if (static_cast<int32_t>(manual_deadline - id(awake_until_ms)) > 0)
+              id(awake_until_ms) = manual_deadline;
+            id(physical_long_armed) = false;
+        - if:
+            condition:
+              lambda: 'return id(pump_active);'
+            then:
+              - script.execute: pump_stop
+            else:
+              - script.execute: physical_button_hold
+    on_release:
+      then:
+        - if:
+            condition:
+              lambda: 'return id(physical_long_armed) && !id(pump_active);'
+            then:
+              - lambda: 'id(physical_long_armed) = false;'
+              - script.execute:
+                  id: pump_request
+                  runtime_ms: 60000
+                  source: !lambda 'return static_cast<int>(VB_MANUAL);'
+                  requested_ml: 0.0
+                  expected_ml: !lambda |-
+                    return id(flow_ml_per_sec) > 0.0f
+                             ? 60.0f * id(flow_ml_per_sec)
+                             : 0.0f;
+
+  - platform: template
+    id: pump_status
+    name: "Pump Status"
+    device_class: running
+    lambda: 'return id(pump_active);'
+
+  - platform: template
+    id: api_connected
+    name: "Home Assistant API Connected"
+    entity_category: diagnostic
+    lambda: 'return id(api_server).is_connected();'
+
+  - platform: status
+    name: "Device Online"
+    entity_category: diagnostic
+
+switch:
+  - platform: template
+    id: power_saving_enabled
+    name: "Power Saving Enabled"
+    icon: mdi:power-sleep
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    on_turn_on:
+      then:
+        - lambda: |-
+            id(awake_until_ms) = millis() + ${manual_awake_ms};
+            id(power_action_result) =
+                "Enabled — five-minute commissioning sleep cycle";
+    on_turn_off:
+      then:
+        - lambda: |-
+            id(awake_until_ms) = 0;
+            id(power_action_result) =
+                "Power saving disabled — device remains awake";
+        - output.turn_on: status_led_output
+
+  - platform: template
+    id: schedule_enabled
+    name: "Schedule Enabled"
+    icon: mdi:calendar-clock
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+
+  - platform: template
+    id: day_sunday
+    name: "Schedule Sunday"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+  - platform: template
+    id: day_monday
+    name: "Schedule Monday"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+  - platform: template
+    id: day_tuesday
+    name: "Schedule Tuesday"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+  - platform: template
+    id: day_wednesday
+    name: "Schedule Wednesday"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+  - platform: template
+    id: day_thursday
+    name: "Schedule Thursday"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+  - platform: template
+    id: day_friday
+    name: "Schedule Friday"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+  - platform: template
+    id: day_saturday
+    name: "Schedule Saturday"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+
+number:
+  - platform: template
+    id: max_continuous_runtime
+    name: "Maximum Continuous Runtime"
+    unit_of_measurement: s
+    icon: mdi:timer-alert-outline
+    min_value: 1
+    max_value: 120
+    step: 1
+    mode: box
+    optimistic: true
+    restore_value: true
+    initial_value: 120
+
+  - platform: template
+    id: auto_min_interval
+    name: "Automatic Dose Minimum Interval"
+    unit_of_measurement: min
+    icon: mdi:timer-lock-outline
+    min_value: 0
+    max_value: 1440
+    step: 1
+    mode: box
+    optimistic: true
+    restore_value: true
+    initial_value: 10
+
+  - platform: template
+    id: max_daily_dose
+    name: "Maximum Daily Dose"
+    unit_of_measurement: mL
+    icon: mdi:cup-water
+    min_value: 0
+    max_value: 100000
+    step: 1
+    mode: box
+    optimistic: true
+    restore_value: true
+    initial_value: 0
+
+  - platform: template
+    id: custom_timed_seconds
+    name: "Custom Timed Run"
+    unit_of_measurement: s
+    icon: mdi:timer-outline
+    min_value: 1
+    max_value: 120
+    step: 1
+    mode: box
+    optimistic: true
+    restore_value: true
+    initial_value: 5
+
+  - platform: template
+    id: custom_dose_ml
+    name: "Custom Dose Volume"
+    unit_of_measurement: mL
+    icon: mdi:cup-water
+    min_value: 0
+    max_value: 10000
+    step: 0.1
+    mode: box
+    optimistic: true
+    restore_value: true
+    initial_value: 0
+
+  - platform: template
+    id: prime_duration
+    name: "Prime Duration"
+    unit_of_measurement: s
+    icon: mdi:water-pump
+    min_value: 1
+    max_value: 120
+    step: 1
+    mode: box
+    optimistic: true
+    restore_value: true
+    initial_value: 60
+
+  - platform: template
+    id: calibration_duration
+    name: "Calibration Duration"
+    unit_of_measurement: s
+    icon: mdi:timer-sand
+    min_value: 10
+    max_value: 120
+    step: 1
+    mode: box
+    optimistic: true
+    restore_value: true
+    initial_value: 60
+
+  - platform: template
+    id: calibration_measured_ml
+    name: "Calibration Measured Volume"
+    unit_of_measurement: mL
+    icon: mdi:beaker-check-outline
+    min_value: 0
+    max_value: 10000
+    step: 0.1
+    mode: box
+    optimistic: true
+    restore_value: false
+    initial_value: 0
+
+  - platform: template
+    id: schedule_hour
+    name: "Schedule Hour"
+    icon: mdi:clock-outline
+    min_value: 0
+    max_value: 23
+    step: 1
+    mode: box
+    optimistic: true
+    restore_value: true
+    initial_value: 10
+
+  - platform: template
+    id: schedule_minute
+    name: "Schedule Minute"
+    icon: mdi:clock-outline
+    min_value: 0
+    max_value: 59
+    step: 1
+    mode: box
+    optimistic: true
+    restore_value: true
+    initial_value: 0
+
+  - platform: template
+    id: schedule_dose_ml
+    name: "Schedule Dose Volume"
+    unit_of_measurement: mL
+    icon: mdi:calendar-arrow-right
+    min_value: 0
+    max_value: 10000
+    step: 0.1
+    mode: box
+    optimistic: true
+    restore_value: true
+    initial_value: 0
+
+button:
+  - platform: template
+    id: stop_pump_button
+    name: "STOP Pump"
+    icon: mdi:stop-circle
+    on_press:
+      then:
+        - script.execute: pump_stop
+
+  - platform: template
+    name: "Commit Schedule"
+    icon: mdi:content-save-check-outline
+    entity_category: config
+    on_press:
+      then:
+        - lambda: 'esphome::global_preferences->sync();'
+
+  - platform: template
+    name: "Run 5 Seconds"
+    icon: mdi:timer-play-outline
+    on_press:
+      then:
+        - script.execute:
+            id: pump_request
+            runtime_ms: 5000
+            source: !lambda 'return static_cast<int>(VB_MANUAL);'
+            requested_ml: 0.0
+            expected_ml: !lambda |-
+              return id(flow_ml_per_sec) > 0.0f ? 5.0f * id(flow_ml_per_sec) : 0.0f;
+  - platform: template
+    name: "Run 15 Seconds"
+    icon: mdi:timer-play-outline
+    on_press:
+      then:
+        - script.execute:
+            id: pump_request
+            runtime_ms: 15000
+            source: !lambda 'return static_cast<int>(VB_MANUAL);'
+            requested_ml: 0.0
+            expected_ml: !lambda |-
+              return id(flow_ml_per_sec) > 0.0f ? 15.0f * id(flow_ml_per_sec) : 0.0f;
+  - platform: template
+    name: "Run 30 Seconds"
+    icon: mdi:timer-play-outline
+    on_press:
+      then:
+        - script.execute:
+            id: pump_request
+            runtime_ms: 30000
+            source: !lambda 'return static_cast<int>(VB_MANUAL);'
+            requested_ml: 0.0
+            expected_ml: !lambda |-
+              return id(flow_ml_per_sec) > 0.0f ? 30.0f * id(flow_ml_per_sec) : 0.0f;
+  - platform: template
+    name: "Run 60 Seconds"
+    icon: mdi:timer-play-outline
+    on_press:
+      then:
+        - script.execute:
+            id: pump_request
+            runtime_ms: 60000
+            source: !lambda 'return static_cast<int>(VB_MANUAL);'
+            requested_ml: 0.0
+            expected_ml: !lambda |-
+              return id(flow_ml_per_sec) > 0.0f ? 60.0f * id(flow_ml_per_sec) : 0.0f;
+
+  - platform: template
+    name: "Start Custom Timed Run"
+    icon: mdi:timer-play
+    on_press:
+      then:
+        - script.execute:
+            id: pump_request
+            runtime_ms: !lambda |-
+              return static_cast<int>(id(custom_timed_seconds).state * 1000.0f);
+            source: !lambda 'return static_cast<int>(VB_MANUAL);'
+            requested_ml: 0.0
+            expected_ml: !lambda |-
+              return id(flow_ml_per_sec) > 0.0f
+                         ? id(custom_timed_seconds).state * id(flow_ml_per_sec)
+                         : 0.0f;
+
+  - platform: template
+    name: "Prime Pump"
+    icon: mdi:water-pump
+    on_press:
+      then:
+        - script.execute:
+            id: pump_request
+            runtime_ms: !lambda |-
+              return static_cast<int>(id(prime_duration).state * 1000.0f);
+            source: !lambda 'return static_cast<int>(VB_PRIME);'
+            requested_ml: 0.0
+            expected_ml: !lambda |-
+              return id(flow_ml_per_sec) > 0.0f
+                         ? id(prime_duration).state * id(flow_ml_per_sec)
+                         : 0.0f;
+
+  - platform: template
+    name: "Dose 10 mL"
+    icon: mdi:cup-water
+    on_press:
+      then:
+        - script.execute:
+            id: volume_request
+            milliliters: 10.0
+            source: !lambda 'return static_cast<int>(VB_MANUAL);'
+  - platform: template
+    name: "Dose 25 mL"
+    icon: mdi:cup-water
+    on_press:
+      then:
+        - script.execute:
+            id: volume_request
+            milliliters: 25.0
+            source: !lambda 'return static_cast<int>(VB_MANUAL);'
+  - platform: template
+    name: "Dose 50 mL"
+    icon: mdi:cup-water
+    on_press:
+      then:
+        - script.execute:
+            id: volume_request
+            milliliters: 50.0
+            source: !lambda 'return static_cast<int>(VB_MANUAL);'
+  - platform: template
+    name: "Dose 100 mL"
+    icon: mdi:cup-water
+    on_press:
+      then:
+        - script.execute:
+            id: volume_request
+            milliliters: 100.0
+            source: !lambda 'return static_cast<int>(VB_MANUAL);'
+  - platform: template
+    name: "Start Custom Volume Dose"
+    icon: mdi:cup-water
+    on_press:
+      then:
+        - script.execute:
+            id: volume_request
+            milliliters: !lambda 'return id(custom_dose_ml).state;'
+            source: !lambda 'return static_cast<int>(VB_MANUAL);'
+
+  - platform: template
+    name: "Run Calibration"
+    icon: mdi:flask-outline
+    on_press:
+      then:
+        - script.execute:
+            id: pump_request
+            runtime_ms: !lambda |-
+              return static_cast<int>(id(calibration_duration).state * 1000.0f);
+            source: !lambda 'return static_cast<int>(VB_CALIBRATION);'
+            requested_ml: 0.0
+            expected_ml: 0.0
+
+  - platform: template
+    name: "Save Calibration"
+    icon: mdi:content-save-check-outline
+    on_press:
+      then:
+        - lambda: |-
+            const auto now = id(sntp_time).now();
+            const uint32_t epoch = vb_sane_time(now) ? now.timestamp : 0;
+            if (!id(calibration_run_complete) ||
+                id(last_calibration_runtime_seconds) <= 0.0f ||
+                id(calibration_measured_ml).state <= 0.0f) {
+              id(fault_text) = "Calibration not saved: complete a run and enter measured mL";
+              return;
+            }
+            id(flow_ml_per_sec) = id(calibration_measured_ml).state /
+                                  id(last_calibration_runtime_seconds);
+            id(calibration_date) = vb_format_epoch(epoch);
+            id(calibration_run_complete) = false;
+            vb_history(id(dose_history_store)).add(
+                epoch, id(calibration_measured_ml).state,
+                id(calibration_measured_ml).state,
+                static_cast<uint32_t>(id(last_calibration_runtime_seconds) * 1000.0f),
+                VB_CALIBRATION, VB_CALIBRATION_SAVED);
+            id(dose_history).publish_state(vb_history(id(dose_history_store)).to_json());
+            id(fault_text) = "None";
+
+  - platform: template
+    name: "Clear Calibration"
+    icon: mdi:flask-remove-outline
+    on_press:
+      then:
+        - lambda: |-
+            id(flow_ml_per_sec) = 0.0f;
+            id(calibration_date) = "Never";
+            id(calibration_run_complete) = false;
+
+  - platform: template
+    name: "Clear Fault"
+    icon: mdi:alert-circle-check-outline
+    on_press:
+      then:
+        - lambda: 'id(fault_text) = "None";'
+
+  - platform: template
+    name: "Stay Awake 30 Minutes"
+    icon: mdi:timer-lock-outline
+    entity_category: config
+    on_press:
+      then:
+        - lambda: |-
+            id(awake_until_ms) = millis() + 1800000U;
+            id(power_action_result) = "Stay-awake window extended by 30 minutes";
+        - output.turn_on: status_led_output
+
+  - platform: template
+    name: "Sleep Now"
+    icon: mdi:power-sleep
+    entity_category: config
+    on_press:
+      then:
+        - if:
+            condition:
+              switch.is_on: power_saving_enabled
+            then:
+              - lambda: 'id(power_action_result) = "Entering five-minute test sleep";'
+              - script.execute: controlled_power_sleep
+            else:
+              - lambda: |-
+                  id(power_action_result) =
+                      "Sleep rejected — enable Power Saving first";
+
+  - platform: template
+    name: "Sync RTC from Network Time"
+    icon: mdi:clock-sync-outline
+    entity_category: config
+    on_press:
+      then:
+        - lambda: |-
+            id(rtc_sync_allowed) = false;
+            const auto now = id(sntp_time).now();
+            if (!id(network_time_synced) || !vb_sane_time(now)) {
+              id(rtc_sync_result) =
+                  "Not synchronized — valid network time is required";
+              return;
+            }
+
+            uint8_t seconds_register = 0;
+            const auto probe =
+                id(rtc_time).read_register(0x00, &seconds_register, 1);
+            if (probe != esphome::i2c::ERROR_OK) {
+              id(rtc_present) = false;
+              id(rtc_time_valid) = false;
+              char message[80];
+              std::snprintf(message, sizeof(message),
+                            "Sync failed — no RTC response at 0x68 (I2C error %d)",
+                            static_cast<int>(probe));
+              id(rtc_sync_result) = message;
+              return;
+            }
+
+            id(rtc_present) = true;
+            id(rtc_sync_allowed) = true;
+            id(rtc_sync_result) = "Synchronizing RTC…";
+        - if:
+            condition:
+              lambda: 'return id(rtc_sync_allowed);'
+            then:
+              - ds1307.write_time:
+                  id: rtc_time
+              - delay: 300ms
+              - lambda: |-
+                  uint8_t registers[7]{};
+                  const auto read_result =
+                      id(rtc_time).read_register(0x00, registers, sizeof(registers));
+                  if (read_result != esphome::i2c::ERROR_OK) {
+                    id(rtc_time_valid) = false;
+                    id(rtc_sync_allowed) = false;
+                    id(rtc_sync_result) =
+                        "Sync failed — RTC did not answer the verification read";
+                    return;
+                  }
+
+                  const auto bcd = [](uint8_t value) -> uint8_t {
+                    return static_cast<uint8_t>((value >> 4) * 10U +
+                                                (value & 0x0FU));
+                  };
+                  uint8_t hour = 0;
+                  if ((registers[2] & 0x40U) != 0) {
+                    const uint8_t hour12 = bcd(registers[2] & 0x1FU);
+                    hour = static_cast<uint8_t>((hour12 % 12U) +
+                                                ((registers[2] & 0x20U) ? 12U : 0U));
+                  } else {
+                    hour = bcd(registers[2] & 0x3FU);
+                  }
+
+                  esphome::ESPTime rtc_value{
+                      .second = bcd(registers[0] & 0x7FU),
+                      .minute = bcd(registers[1] & 0x7FU),
+                      .hour = hour,
+                      .day_of_week = static_cast<uint8_t>(registers[3] & 0x07U),
+                      .day_of_month = bcd(registers[4] & 0x3FU),
+                      .month = bcd(registers[5] & 0x1FU),
+                      .year = static_cast<uint16_t>(2000U + bcd(registers[6])),
+                  };
+                  rtc_value.recalc_timestamp_utc(false);
+                  const auto network_utc = id(sntp_time).utcnow();
+                  const int64_t drift =
+                      static_cast<int64_t>(rtc_value.timestamp) -
+                      static_cast<int64_t>(network_utc.timestamp);
+                  const uint64_t absolute_drift =
+                      static_cast<uint64_t>(drift < 0 ? -drift : drift);
+
+                  uint8_t status_register = 0;
+                  const auto status_read =
+                      id(rtc_time).read_register(0x0F, &status_register, 1);
+                  bool status_ok = status_read == esphome::i2c::ERROR_OK;
+                  if (status_ok && (status_register & 0x80U) != 0) {
+                    status_register &= static_cast<uint8_t>(~0x80U);
+                    status_ok = id(rtc_time).write_register(
+                                    0x0F, &status_register, 1) ==
+                                esphome::i2c::ERROR_OK;
+                  }
+
+                  // A raw RTC register read has no day-of-year field. Validate
+                  // the fields that the DS3231 actually stores instead of the
+                  // general helper, which expects day-of-year to be populated.
+                  const bool rtc_fields_valid =
+                      rtc_value.is_valid(/*check_day_of_week=*/true,
+                                         /*check_day_of_year=*/false) &&
+                      rtc_value.year >= 2024 && rtc_value.year <= 2099;
+                  if (!rtc_fields_valid || absolute_drift > 5U ||
+                      !status_ok) {
+                    id(rtc_time_valid) = false;
+                    id(rtc_sync_allowed) = false;
+                    id(rtc_sync_result) =
+                        "Sync failed — RTC verification did not match network time";
+                    return;
+                  }
+
+                  id(rtc_present) = true;
+                  id(rtc_time_valid) = true;
+                  id(time_source) = 2;
+                  id(rtc_sync_result) =
+                      "Synchronized and verified from network time";
+              - if:
+                  condition:
+                    lambda: 'return id(rtc_sync_allowed);'
+                  then:
+                    - ds1307.read_time:
+                        id: rtc_time
+
+  - platform: template
+    name: "Reboot Device"
+    icon: mdi:restart
+    entity_category: config
+    on_press:
+      then:
+        - script.execute: pump_stop
+        - delay: 100ms
+        - button.press: reboot_internal
+
+  - platform: template
+    name: "Arm Factory Reset"
+    icon: mdi:shield-key-outline
+    entity_category: config
+    on_press:
+      then:
+        - lambda: 'id(factory_reset_armed_until) = millis() + 30000U;'
+
+  - platform: template
+    name: "Confirm Factory Reset"
+    icon: mdi:delete-forever-outline
+    entity_category: config
+    on_press:
+      then:
+        - if:
+            condition:
+              lambda: |-
+                return id(factory_reset_armed_until) != 0 &&
+                       static_cast<int32_t>(id(factory_reset_armed_until) - millis()) > 0;
+            then:
+              - output.turn_off: pump_output
+              - script.stop: pump_request
+              - button.press: factory_reset_internal
+            else:
+              - lambda: 'id(fault_text) = "Factory reset not armed";'
+
+  - platform: restart
+    id: reboot_internal
+    internal: true
+  - platform: factory_reset
+    id: factory_reset_internal
+    internal: true
+
+sensor:
+  - platform: template
+    id: calibrated_flow
+    name: "Calibrated Flow Rate"
+    unit_of_measurement: "mL/s"
+    state_class: measurement
+    accuracy_decimals: 4
+    update_interval: 10s
+    lambda: |-
+      if (id(flow_ml_per_sec) <= 0.0f) return NAN;
+      return id(flow_ml_per_sec);
+
+  - platform: template
+    id: dispensed_today
+    name: "Amount Dispensed Today"
+    unit_of_measurement: mL
+    state_class: total_increasing
+    accuracy_decimals: 2
+    update_interval: 10s
+    lambda: |-
+      if (id(flow_ml_per_sec) <= 0.0f) return NAN;
+      return id(today_volume_ml);
+
+  - platform: template
+    id: total_volume
+    name: "Total Estimated Volume"
+    unit_of_measurement: mL
+    state_class: total_increasing
+    accuracy_decimals: 2
+    update_interval: 10s
+    lambda: |-
+      if (id(flow_ml_per_sec) <= 0.0f) return NAN;
+      return id(lifetime_volume_ml);
+
+  - platform: template
+    id: total_runtime
+    name: "Total Pump Runtime"
+    unit_of_measurement: s
+    state_class: total_increasing
+    accuracy_decimals: 1
+    update_interval: 10s
+    lambda: 'return id(lifetime_runtime_seconds);'
+
+  - platform: template
+    name: "Successful Dose Count"
+    state_class: total_increasing
+    accuracy_decimals: 0
+    update_interval: 30s
+    lambda: 'return id(dose_count);'
+
+  - platform: wifi_signal
+    name: "Wi-Fi Signal"
+    id: wifi_signal_db
+    update_interval: 30s
+    entity_category: diagnostic
+
+  - platform: uptime
+    name: "Uptime"
+    entity_category: diagnostic
+
+text_sensor:
+  - platform: template
+    id: appliance_status
+    name: "Appliance Status"
+    icon: mdi:state-machine
+    update_interval: 1s
+    lambda: |-
+      if (id(fault_text) != "None") return {"FAULT"};
+      if (id(schedule_enabled).state && id(time_source) == 0)
+        return {"FAULT"};
+      if (id(pump_active) && id(active_source) == VB_PRIME) return {"PRIME"};
+      if (id(pump_active)) return {"DOSING"};
+      return {"READY"};
+
+  - platform: template
+    id: power_saving_status_text
+    name: "Power Saving Status"
+    icon: mdi:power-sleep
+    update_interval: 1s
+    lambda: |-
+      if (!id(power_saving_enabled).state)
+        return {"Disabled — awake continuously"};
+      if (id(pump_active)) return {"Enabled — awake while dosing"};
+      if (static_cast<int32_t>(id(awake_until_ms) - millis()) <= 0)
+        return {"Enabled — preparing test sleep"};
+      return {"Enabled — commissioning cycle"};
+
+  - platform: template
+    id: wake_reason_text
+    name: "Wake Reason"
+    icon: mdi:weather-sunset-up
+    entity_category: diagnostic
+    update_interval: 5s
+    lambda: 'return {id(wake_reason)};'
+
+  - platform: template
+    id: awake_remaining_text
+    name: "Awake Time Remaining"
+    icon: mdi:timer-outline
+    update_interval: 1s
+    lambda: |-
+      if (!id(power_saving_enabled).state) return {"Continuous"};
+      const int32_t remaining_ms =
+          static_cast<int32_t>(id(awake_until_ms) - millis());
+      if (remaining_ms <= 0) return {"Sleeping now"};
+      const uint32_t seconds = static_cast<uint32_t>(remaining_ms) / 1000U;
+      char value[32];
+      std::snprintf(value, sizeof(value), "%u:%02u",
+                    static_cast<unsigned>(seconds / 60U),
+                    static_cast<unsigned>(seconds % 60U));
+      return {value};
+
+  - platform: template
+    id: next_power_wake_text
+    name: "Next Power Wake"
+    icon: mdi:clock-start
+    update_interval: 5s
+    lambda: |-
+      if (!id(power_saving_enabled).state)
+        return {"Not scheduled — power saving disabled"};
+      return {"Five minutes after sleep (commissioning mode)"};
+
+  - platform: template
+    id: power_action_result_text
+    name: "Power Saving Action"
+    icon: mdi:information-outline
+    entity_category: diagnostic
+    update_interval: 1s
+    lambda: 'return {id(power_action_result)};'
+
+  - platform: template
+    id: current_time_text
+    name: "Current Time"
+    icon: mdi:clock-outline
+    update_interval: 1s
+    lambda: |-
+      auto now = id(sntp_time).now();
+      if (!vb_sane_time(now) || id(time_source) == 0)
+        return {"Invalid — schedule inhibited"};
+      char value[48];
+      now.strftime(value, sizeof(value), "%a %b %d, %Y %I:%M:%S %p");
+      return {value};
+
+  - platform: template
+    id: rtc_status_text
+    name: "RTC Status"
+    icon: mdi:clock-check-outline
+    update_interval: 10s
+    lambda: |-
+      if (!id(rtc_present)) return {"Not Installed"};
+      if (!id(rtc_time_valid)) return {"Installed — invalid time"};
+      return {"Installed — valid"};
+
+  - platform: template
+    id: rtc_readback_text
+    name: "RTC Readback"
+    icon: mdi:clock-digital
+    entity_category: diagnostic
+    update_interval: 2s
+    lambda: |-
+      uint8_t registers[7]{};
+      const auto read_result =
+          id(rtc_time).read_register(0x00, registers, sizeof(registers));
+      if (read_result != esphome::i2c::ERROR_OK) {
+        id(rtc_present) = false;
+        return {"Unavailable — no RTC response"};
+      }
+
+      id(rtc_present) = true;
+      const auto bcd = [](uint8_t value) -> uint8_t {
+        return static_cast<uint8_t>((value >> 4) * 10U + (value & 0x0FU));
+      };
+      uint8_t hour = 0;
+      if ((registers[2] & 0x40U) != 0) {
+        const uint8_t hour12 = bcd(registers[2] & 0x1FU);
+        hour = static_cast<uint8_t>((hour12 % 12U) +
+                                    ((registers[2] & 0x20U) ? 12U : 0U));
+      } else {
+        hour = bcd(registers[2] & 0x3FU);
+      }
+
+      esphome::ESPTime rtc_utc{
+          .second = bcd(registers[0] & 0x7FU),
+          .minute = bcd(registers[1] & 0x7FU),
+          .hour = hour,
+          .day_of_week = static_cast<uint8_t>(registers[3] & 0x07U),
+          .day_of_month = bcd(registers[4] & 0x3FU),
+          .month = bcd(registers[5] & 0x1FU),
+          .year = static_cast<uint16_t>(2000U + bcd(registers[6])),
+      };
+      rtc_utc.recalc_timestamp_utc(false);
+      const bool valid =
+          rtc_utc.is_valid(/*check_day_of_week=*/true,
+                           /*check_day_of_year=*/false) &&
+          rtc_utc.year >= 2024 && rtc_utc.year <= 2099;
+      id(rtc_time_valid) = valid;
+      if (!valid) return {"Invalid — schedule inhibited"};
+
+      auto rtc_local = esphome::ESPTime::from_epoch_local(rtc_utc.timestamp);
+      char value[64];
+      rtc_local.strftime(value, sizeof(value),
+                         "Valid — %a %b %d, %Y %I:%M:%S %p");
+      return {value};
+
+  - platform: template
+    id: time_status_text
+    name: "Time Status"
+    icon: mdi:timeline-clock-outline
+    update_interval: 5s
+    lambda: |-
+      const auto now = id(sntp_time).now();
+      if (!vb_sane_time(now) || id(time_source) == 0)
+        return {"FAULT — no valid RTC or network time"};
+      if (id(time_source) == 2 && id(rtc_present))
+        return {"Network synchronized; RTC corrected"};
+      if (id(time_source) == 2) return {"Network time (RTC not installed)"};
+      return {"RTC time (network unavailable)"};
+
+  - platform: template
+    id: rtc_sync_result_text
+    name: "RTC Sync Result"
+    icon: mdi:clock-check-outline
+    entity_category: diagnostic
+    update_interval: 2s
+    lambda: 'return {id(rtc_sync_result)};'
+
+  - platform: template
+    id: pump_mode_text
+    name: "Pump State"
+    icon: mdi:pump
+    update_interval: 1s
+    lambda: |-
+      if (!id(pump_active)) return {"OFF"};
+      if (id(active_source) == VB_PRIME) return {"ON — PRIME"};
+      if (id(active_source) == VB_CALIBRATION) return {"ON — CALIBRATION"};
+      return {"ON — DOSING"};
+
+  - platform: template
+    id: last_success_text
+    name: "Last Successful Dose"
+    icon: mdi:history
+    update_interval: 10s
+    lambda: 'return {id(last_successful_dose)};'
+
+  - platform: template
+    id: last_attempt_text
+    name: "Last Attempted Dose"
+    icon: mdi:history
+    update_interval: 10s
+    lambda: 'return {id(last_attempted_dose)};'
+
+  - platform: template
+    id: next_schedule_text
+    name: "Next Scheduled Dose"
+    icon: mdi:calendar-clock
+    update_interval: 15s
+    lambda: |-
+      if (!id(schedule_enabled).state) return {"Disabled"};
+      if (id(flow_ml_per_sec) <= 0.0f) return {"Unavailable — calibration required"};
+      const auto now = id(sntp_time).now();
+      if (!vb_sane_time(now) || id(time_source) == 0)
+        return {"Unavailable — time fault"};
+      uint8_t mask = 0;
+      if (id(day_sunday).state) mask |= 1U << 0;
+      if (id(day_monday).state) mask |= 1U << 1;
+      if (id(day_tuesday).state) mask |= 1U << 2;
+      if (id(day_wednesday).state) mask |= 1U << 3;
+      if (id(day_thursday).state) mask |= 1U << 4;
+      if (id(day_friday).state) mask |= 1U << 5;
+      if (id(day_saturday).state) mask |= 1U << 6;
+      if (mask == 0 || id(schedule_dose_ml).state <= 0.0f)
+        return {"Not configured"};
+      const uint32_t next = vb_next_schedule_epoch(
+          now, mask, static_cast<int>(id(schedule_hour).state),
+          static_cast<int>(id(schedule_minute).state));
+      if (next == 0) return {"Unable to calculate"};
+      char value[96];
+      std::snprintf(value, sizeof(value), "%s — %.1f mL",
+                    vb_format_epoch(next).c_str(), id(schedule_dose_ml).state);
+      return {value};
+
+  - platform: template
+    id: calibration_status_text
+    name: "Calibration Status"
+    icon: mdi:flask-outline
+    update_interval: 10s
+    lambda: |-
+      if (id(flow_ml_per_sec) <= 0.0f) return {"UNCALIBRATED — mL dosing disabled"};
+      char value[120];
+      std::snprintf(value, sizeof(value), "Calibrated %.4f mL/s — %s",
+                    id(flow_ml_per_sec), id(calibration_date).c_str());
+      return {value};
+
+  - platform: template
+    id: daily_limit_status_text
+    name: "Daily Dose Limit Status"
+    icon: mdi:cup-water
+    update_interval: 10s
+    lambda: |-
+      if (id(flow_ml_per_sec) <= 0.0f)
+        return {"Unavailable until calibrated"};
+      if (id(max_daily_dose).state <= 0.0f)
+        return {"Not configured (0 mL setting)"};
+      char value[96];
+      std::snprintf(value, sizeof(value), "%.2f / %.2f mL used today",
+                    id(today_volume_ml), id(max_daily_dose).state);
+      return {value};
+
+  - platform: template
+    id: lockout_status_text
+    name: "Automatic Dose Lockout"
+    icon: mdi:timer-lock-outline
+    update_interval: 10s
+    lambda: |-
+      if (id(last_automatic_epoch) == 0) return {"Ready"};
+      const auto now = id(sntp_time).now();
+      if (!vb_sane_time(now)) return {"Time invalid"};
+      const uint32_t interval_s = static_cast<uint32_t>(
+          id(auto_min_interval).state * 60.0f);
+      if (now.timestamp >= id(last_automatic_epoch) + interval_s)
+        return {"Ready"};
+      const uint32_t remaining = id(last_automatic_epoch) + interval_s - now.timestamp;
+      char value[64];
+      std::snprintf(value, sizeof(value), "%u min remaining",
+                    static_cast<unsigned>((remaining + 59U) / 60U));
+      return {value};
+
+  - platform: template
+    id: fault_status_text
+    name: "Faults"
+    icon: mdi:alert-circle-outline
+    update_interval: 2s
+    lambda: |-
+      if (id(fault_text) != "None") return {id(fault_text)};
+      if (id(schedule_enabled).state && id(time_source) == 0)
+        return {"Schedule inhibited: no valid time"};
+      return {"None"};
+
+  - platform: template
+    name: "Reservoir Status"
+    icon: mdi:bottle-tonic-outline
+    update_interval: 60s
+    lambda: 'return {"Not Installed"};'
+
+  - platform: template
+    name: "Flow Verification Status"
+    icon: mdi:waves-arrow-right
+    update_interval: 60s
+    lambda: 'return {"Not Installed"};'
+
+  - platform: template
+    name: "Configured Time Zone"
+    icon: mdi:map-clock-outline
+    entity_category: diagnostic
+    update_interval: 60s
+    lambda: 'return {"${timezone_default}"};'
+
+  - platform: template
+    name: "Web Admin Password Setting"
+    icon: mdi:shield-lock-outline
+    entity_category: diagnostic
+    update_interval: 60s
+    lambda: 'return {"Managed in secrets.yaml; reflash required to change"};'
+
+  - platform: template
+    id: dose_history
+    name: "Dose History JSON"
+    icon: mdi:history
+    entity_category: diagnostic
+    disabled_by_default: true
+    update_interval: 30s
+    lambda: 'return {vb_history(id(dose_history_store)).to_json()};'
+
+  - platform: wifi_info
+    ip_address:
+      name: "IP Address"
+      entity_category: diagnostic
+    ssid:
+      name: "Connected SSID"
+      entity_category: diagnostic
+    mac_address:
+      name: "Wi-Fi MAC Address"
+      entity_category: diagnostic
+
+  - platform: version
+    name: "Firmware Version"
+    entity_category: diagnostic
