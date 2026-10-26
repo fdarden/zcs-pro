@@ -1,0 +1,13 @@
+# ESPHome generated files and private configuration
+.esphome/
+secrets.yaml
+
+# Compiled firmware and build artifacts
+*.bin
+*.elf
+*.map
+*.log
+tmp/
+
+# Local operating-system files
+.DS_Store
